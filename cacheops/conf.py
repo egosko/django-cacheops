@@ -46,9 +46,11 @@ if DEGRADE_ON_FAILURE:
 else:
     handle_connection_failure = identity
 
+
 class SafeRedis(redis.StrictRedis):
     get = handle_connection_failure(redis.StrictRedis.get)
 
+CacheopsRedis = SafeRedis if DEGRADE_ON_FAILURE else redis.StrictRedis
 
 class LazyRedis(object):
     def _setup(self):
@@ -72,6 +74,24 @@ class LazyRedis(object):
         return setattr(self, name, value)
 
 redis_client = LazyRedis()
+
+redis_conf = settings.CACHEOPS_REDIS
+try:
+    redis_replica_conf = settings.CACHEOPS_REDIS_REPLICA
+    redis_replica = redis.StrictRedis(**redis_replica_conf)
+
+    class ReplicaProxyRedis(CacheopsRedis):
+        """ Proxy `get` calls to redis replica.
+        """
+        def get(self, *args, **kwargs):
+            try:
+                return redis_replica.get(*args, **kwargs)
+            except redis.ConnectionError:
+                return super(ReplicaProxyRedis, self).get(*args, **kwargs)
+
+    redis_client = ReplicaProxyRedis(**redis_conf)
+except AttributeError:
+    redis_client = CacheopsRedis(**redis_conf)
 
 
 @memoize
