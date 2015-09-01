@@ -50,17 +50,18 @@ else:
 class SafeRedis(redis.StrictRedis):
     get = handle_connection_failure(redis.StrictRedis.get)
 
+
+try:
+    redis_conf = settings.CACHEOPS_REDIS
+except AttributeError:
+    raise ImproperlyConfigured('You must specify non-empty CACHEOPS_REDIS setting to use cacheops')
+
 CacheopsRedis = SafeRedis if DEGRADE_ON_FAILURE else redis.StrictRedis
 
 class LazyRedis(object):
     def _setup(self):
         # Connecting to redis
-        try:
-            redis_conf = settings.CACHEOPS_REDIS
-        except AttributeError:
-            raise ImproperlyConfigured('You must specify CACHEOPS_REDIS setting to use cacheops')
-
-        client = (SafeRedis if DEGRADE_ON_FAILURE else redis.StrictRedis)(**redis_conf)
+        client = CacheopsRedis(**redis_conf)
 
         object.__setattr__(self, '__class__', client.__class__)
         object.__setattr__(self, '__dict__', client.__dict__)
@@ -73,9 +74,7 @@ class LazyRedis(object):
         self._setup()
         return setattr(self, name, value)
 
-redis_client = LazyRedis()
 
-redis_conf = settings.CACHEOPS_REDIS
 try:
     redis_replica_conf = settings.CACHEOPS_REDIS_REPLICA
     redis_replica = redis.StrictRedis(**redis_replica_conf)
@@ -86,12 +85,12 @@ try:
         def get(self, *args, **kwargs):
             try:
                 return redis_replica.get(*args, **kwargs)
-            except redis.ConnectionError:
+            except (redis.ConnectionError, redis.TimeoutError):
                 return super(ReplicaProxyRedis, self).get(*args, **kwargs)
 
     redis_client = ReplicaProxyRedis(**redis_conf)
 except AttributeError:
-    redis_client = CacheopsRedis(**redis_conf)
+    redis_client = LazyRedis()
 
 
 @memoize
