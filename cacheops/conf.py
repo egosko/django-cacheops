@@ -90,7 +90,7 @@ try:
             try:
                 return redis_replica.get(*args, **kwargs)
             except redis.TimeoutError:
-                logger.exception("TimeoutError occured while read from replica")
+                logger.exception("TimeoutError occured while reading from replica")
             except redis.ConnectionError:
                 pass
             return super(ReplicaProxyRedis, self).get(*args, **kwargs)
