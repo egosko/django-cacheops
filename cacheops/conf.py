@@ -47,6 +47,8 @@ if DEGRADE_ON_FAILURE:
             warnings.warn("The cacheops cache is unreachable! Error: %s" % e, RuntimeWarning)
         except redis.TimeoutError as e:
             warnings.warn("The cacheops cache timed out! Error: %s" % e, RuntimeWarning)
+        except redis.RedisError as e:
+            logger.exception(e)
 else:
     handle_connection_failure = identity
 
@@ -93,6 +95,8 @@ try:
                 logger.exception("TimeoutError occured while reading from replica")
             except redis.ConnectionError:
                 pass
+            except redis.RedisError as e:
+                logger.exception(e)
             return super(ReplicaProxyRedis, self).get(*args, **kwargs)
 
     redis_client = ReplicaProxyRedis(**redis_conf)
