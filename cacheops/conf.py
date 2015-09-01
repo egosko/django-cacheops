@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 from copy import deepcopy
+from logging import getLogger
 import warnings
 import six
 import redis
@@ -7,6 +8,9 @@ from funcy import memoize, decorator, identity, is_tuple, merge
 
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
+
+
+logger = getLogger(__name__)
 
 
 ALL_OPS = ('get', 'fetch', 'count', 'exists')
@@ -85,8 +89,11 @@ try:
         def get(self, *args, **kwargs):
             try:
                 return redis_replica.get(*args, **kwargs)
-            except (redis.ConnectionError, redis.TimeoutError):
-                return super(ReplicaProxyRedis, self).get(*args, **kwargs)
+            except redis.TimeoutError:
+                logger.exception("TimeoutError occured while read from replica")
+            except redis.ConnectionError:
+                pass
+            return super(ReplicaProxyRedis, self).get(*args, **kwargs)
 
     redis_client = ReplicaProxyRedis(**redis_conf)
 except AttributeError:
