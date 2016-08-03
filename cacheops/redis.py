@@ -1,12 +1,14 @@
 from __future__ import absolute_import
 import warnings
 import six
-
+from logging import getLogger
 from funcy import decorator, identity, memoize
 import redis
 from django.core.exceptions import ImproperlyConfigured
 
 from .conf import settings
+
+logger = getLogger(__name__)
 
 
 if settings.CACHEOPS_DEGRADE_ON_FAILURE:
@@ -18,6 +20,8 @@ if settings.CACHEOPS_DEGRADE_ON_FAILURE:
             warnings.warn("The cacheops cache is unreachable! Error: %s" % e, RuntimeWarning)
         except redis.TimeoutError as e:
             warnings.warn("The cacheops cache timed out! Error: %s" % e, RuntimeWarning)
+        except redis.RedisError as e:
+            logger.exception(e)
 else:
     handle_connection_failure = identity
 
@@ -26,12 +30,14 @@ class SafeRedis(redis.StrictRedis):
     get = handle_connection_failure(redis.StrictRedis.get)
 
 
+Redis = SafeRedis if settings.CACHEOPS_DEGRADE_ON_FAILURE else redis.StrictRedis
+
+
 class LazyRedis(object):
     def _setup(self):
         if not settings.CACHEOPS_REDIS:
             raise ImproperlyConfigured('You must specify CACHEOPS_REDIS setting to use cacheops')
 
-        Redis = SafeRedis if settings.CACHEOPS_DEGRADE_ON_FAILURE else redis.StrictRedis
         # Allow client connection settings to be specified by a URL.
         if isinstance(settings.CACHEOPS_REDIS, six.string_types):
             client = Redis.from_url(settings.CACHEOPS_REDIS)
@@ -49,7 +55,28 @@ class LazyRedis(object):
         self._setup()
         return setattr(self, name, value)
 
-redis_client = LazyRedis()
+try:
+    redis_conf = settings.CACHEOPS_REDIS
+    redis_replica_conf = settings.CACHEOPS_REDIS_REPLICA
+    redis_replica = redis.StrictRedis(**redis_replica_conf)
+
+    class ReplicaProxyRedis(Redis):
+        """ Proxy `get` calls to redis replica.
+        """
+        def get(self, *args, **kwargs):
+            try:
+                return redis_replica.get(*args, **kwargs)
+            except redis.TimeoutError:
+                logger.exception("TimeoutError occured while reading from replica")
+            except redis.ConnectionError:
+                pass
+            except redis.RedisError as e:
+                logger.exception(e)
+            return super(ReplicaProxyRedis, self).get(*args, **kwargs)
+
+    redis_client = ReplicaProxyRedis(**redis_conf)
+except AttributeError:
+    redis_client = LazyRedis()
 
 
 ### Lua script loader
