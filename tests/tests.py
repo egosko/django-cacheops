@@ -2,6 +2,7 @@
 import re, copy
 import unittest
 
+import mock
 from django.db import connection, connections
 from django.test import TestCase
 from django.test.client import RequestFactory
@@ -9,6 +10,8 @@ from django.contrib.auth.models import User, Group, Permission
 from django.contrib.contenttypes.models import ContentType
 from django.template import Context, Template
 from django.db.models import F
+from django.core.urlresolvers import reverse
+from redis import TimeoutError
 
 from cacheops import invalidate_all, invalidate_model, invalidate_obj, no_invalidation, \
                      cached, cached_view, cached_as, cached_view_as
@@ -16,6 +19,7 @@ from cacheops import invalidate_fragment
 from cacheops.templatetags.cacheops import register
 from cacheops.transaction import transaction_state
 from cacheops.signals import cache_read
+from cacheops.conf import settings
 
 decorator_tag = register.decorator_tag
 from .models import *
@@ -32,6 +36,12 @@ class BaseTestCase(TestCase):
 
     def tearDown(self):
         transaction_state._stack = self._stack
+
+        try:
+            from cacheops.redis import clear_degraded_client_marks
+            clear_degraded_client_marks()
+        except ImportError:
+            pass
 
 
 class BasicTests(BaseTestCase):
@@ -1013,6 +1023,32 @@ class SignalsTests(BaseTestCase):
         self.assertEqual(get_calls(), 1)
         self.assertEqual(self.signal_calls, [{'sender': None, 'func': func, 'hit': True}])
 
+
+@unittest.skipIf(not (settings.CACHEOPS_DEGRADE_PERSISTENT_PER_REQUEST
+                      and settings.CACHEOPS_DEGRADE_ON_FAILURE),
+                 "Persistent degradation is disabled")
+class DegradePersistentTestCase(BaseTestCase):
+
+    @mock.patch("redis.client.StrictRedis.execute_command", side_effect=TimeoutError())
+    def testDegradePersistent(self, patched_execute):
+        with self.assertNumQueries(2):
+            cnt1 = Category.objects.cache().count()
+            self.assertEqual(patched_execute.call_count, 1)
+            patched_execute.reset_mock()
+
+            cnt2 = Category.objects.cache().count()
+            self.assertEqual(patched_execute.call_count, 0)
+            self.assertEqual(cnt1, cnt2)
+
+    @mock.patch("redis.client.StrictRedis.execute_command", side_effect=TimeoutError())
+    def testDegradePersistentPerRequest(self, patched_execute):
+        url = reverse("category_cache_view")
+        for i in range(2):
+            # degraded clients are cleaned on every request
+            with self.assertNumQueries(1):
+                self.client.get(url)
+                self.assertEqual(patched_execute.call_count, 1)
+                patched_execute.reset_mock()
 
 # Utilities
 

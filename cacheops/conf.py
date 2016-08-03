@@ -15,7 +15,8 @@ class Settings(object):
     CACHEOPS_DEFAULTS = {}
     CACHEOPS = {}
     CACHEOPS_LRU = False
-    CACHEOPS_DEGRADE_ON_FAILURE = False
+    CACHEOPS_DEGRADE_ON_FAILURE = True
+    CACHEOPS_DEGRADE_PERSISTENT_PER_REQUEST = False
     FILE_CACHE_DIR = '/tmp/cacheops_file_cache'
     FILE_CACHE_TIMEOUT = 60*60*24*30
 
