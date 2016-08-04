@@ -1024,7 +1024,7 @@ class SignalsTests(BaseTestCase):
         self.assertEqual(self.signal_calls, [{'sender': None, 'func': func, 'hit': True}])
 
 
-@unittest.skipIf(not (settings.CACHEOPS_DEGRADE_PERSISTENT_PER_REQUEST
+@unittest.skipIf(not (settings.CACHEOPS_DEGRADE_TILL_REQUEST_FINISHED
                       and settings.CACHEOPS_DEGRADE_ON_FAILURE),
                  "Persistent degradation is disabled")
 class DegradePersistentTestCase(BaseTestCase):

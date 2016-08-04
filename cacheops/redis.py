@@ -26,7 +26,7 @@ if settings.CACHEOPS_DEGRADE_ON_FAILURE:
         except redis.RedisError as e:
             logger.exception(e)
 
-    if settings.CACHEOPS_DEGRADE_PERSISTENT_PER_REQUEST:
+    if settings.CACHEOPS_DEGRADE_TILL_REQUEST_FINISHED:
         degraded_client_set = set()
 
 
@@ -58,7 +58,6 @@ if settings.CACHEOPS_DEGRADE_ON_FAILURE:
             """ Clear all degraded client marks which was setted in current or
             previous request.
             """
-            global degraded_client_set
             degraded_client_set.clear()
     else:
         degrade_client_decorator = identity
