@@ -2,6 +2,9 @@ from __future__ import absolute_import
 import warnings
 import six
 from logging import getLogger
+
+from django.core.signals import request_started, request_finished
+from django.dispatch import receiver
 from funcy import decorator, identity, memoize
 import redis
 from django.core.exceptions import ImproperlyConfigured
@@ -22,12 +25,50 @@ if settings.CACHEOPS_DEGRADE_ON_FAILURE:
             warnings.warn("The cacheops cache timed out! Error: %s" % e, RuntimeWarning)
         except redis.RedisError as e:
             logger.exception(e)
+
+    if settings.CACHEOPS_DEGRADE_TILL_REQUEST_FINISHED:
+        degraded_client_set = set()
+
+
+        class DegradedClientError(redis.RedisError):
+            """ Error which raised after attempt to make a query to the degraded
+            client.
+            """
+
+
+        @decorator
+        def degrade_client_decorator(call):
+            """ Decorator which marks client as degraded if Connection or Timeout
+            error occured during the query.
+            Query to the degraded client won't be executed at all.
+            Degraded mark saves during the request.
+            """
+            if call.self in degraded_client_set:
+                raise DegradedClientError()
+
+            try:
+                return call()
+            except (redis.ConnectionError, redis.TimeoutError):
+                degraded_client_set.add(call.self)
+                raise
+
+
+        @receiver([request_started, request_finished])
+        def clear_degraded_client_marks(*args, **kwargs):
+            """ Clear all degraded client marks which was setted in current or
+            previous request.
+            """
+            degraded_client_set.clear()
+    else:
+        degrade_client_decorator = identity
 else:
     handle_connection_failure = identity
+    degrade_client_decorator = identity
 
 
 class SafeRedis(redis.StrictRedis):
-    get = handle_connection_failure(redis.StrictRedis.get)
+    get = handle_connection_failure(degrade_client_decorator(redis.StrictRedis.get))
+    evalsha = degrade_client_decorator(redis.StrictRedis.evalsha)
 
 
 Redis = SafeRedis if settings.CACHEOPS_DEGRADE_ON_FAILURE else redis.StrictRedis
@@ -58,7 +99,10 @@ class LazyRedis(object):
 try:
     redis_conf = settings.CACHEOPS_REDIS
     redis_replica_conf = settings.CACHEOPS_REDIS_REPLICA
-    redis_replica = redis.StrictRedis(**redis_replica_conf)
+
+    class SafeReplicaRedis(redis.StrictRedis):
+        get = degrade_client_decorator(redis.StrictRedis.get)
+    redis_replica = SafeReplicaRedis(**redis_replica_conf)
 
     class ReplicaProxyRedis(Redis):
         """ Proxy `get` calls to redis replica.
