@@ -10,6 +10,7 @@ from .cross import pickle, md5
 import django
 from django.utils.encoding import smart_str, force_text
 from django.core.exceptions import ImproperlyConfigured
+from django.db import DEFAULT_DB_ALIAS
 from django.db.models import Manager, Model
 from django.db.models.query import QuerySet
 from django.db.models.sql.datastructures import EmptyResultSet
@@ -148,7 +149,7 @@ class QuerySetMixin(object):
         md.update(stamp_fields(self.model))
         # Use query SQL as part of a key
         try:
-            sql, params = self.query.get_compiler(self.db).as_sql()
+            sql, params = self.query.get_compiler(self.db or DEFAULT_DB_ALIAS).as_sql()
             try:
                 sql_str = sql % params
             except UnicodeDecodeError:

@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
+from copy import deepcopy
+from logging import getLogger
+import warnings
 import six
 from funcy import memoize, merge
 
 from django.conf import settings as base_settings
 from django.core.exceptions import ImproperlyConfigured
 
+logger = getLogger(__name__)
 
 ALL_OPS = {'get', 'fetch', 'count', 'exists'}
 
@@ -24,7 +28,78 @@ class Settings(object):
             return getattr(base_settings, name)
         return object.__getattribute__(self, name)
 
+
 settings = Settings()
+
+LRU = getattr(settings, 'CACHEOPS_LRU', False)
+DEGRADE_ON_FAILURE = getattr(settings, 'CACHEOPS_DEGRADE_ON_FAILURE', False)
+
+
+# Support DEGRADE_ON_FAILURE
+if DEGRADE_ON_FAILURE:
+    @decorator
+    def handle_connection_failure(call):
+        try:
+            return call()
+        except redis.ConnectionError as e:
+            warnings.warn("The cacheops cache is unreachable! Error: %s" % e, RuntimeWarning)
+        except redis.TimeoutError as e:
+            warnings.warn("The cacheops cache timed out! Error: %s" % e, RuntimeWarning)
+        except redis.RedisError as e:
+            logger.exception(e)
+else:
+    handle_connection_failure = identity
+
+
+class SafeRedis(redis.StrictRedis):
+    get = handle_connection_failure(redis.StrictRedis.get)
+
+
+try:
+    redis_conf = settings.CACHEOPS_REDIS
+except AttributeError:
+    raise ImproperlyConfigured('You must specify non-empty CACHEOPS_REDIS setting to use cacheops')
+
+CacheopsRedis = SafeRedis if DEGRADE_ON_FAILURE else redis.StrictRedis
+
+class LazyRedis(object):
+    def _setup(self):
+        # Connecting to redis
+        client = CacheopsRedis(**redis_conf)
+
+        object.__setattr__(self, '__class__', client.__class__)
+        object.__setattr__(self, '__dict__', client.__dict__)
+
+    def __getattr__(self, name):
+        self._setup()
+        return getattr(self, name)
+
+    def __setattr__(self, name, value):
+        self._setup()
+        return setattr(self, name, value)
+
+
+try:
+    redis_replica_conf = settings.CACHEOPS_REDIS_REPLICA
+    redis_replica = redis.StrictRedis(**redis_replica_conf)
+
+    class ReplicaProxyRedis(CacheopsRedis):
+        """ Proxy `get` calls to redis replica.
+        """
+        def get(self, *args, **kwargs):
+            try:
+                return redis_replica.get(*args, **kwargs)
+            except redis.TimeoutError:
+                logger.exception("TimeoutError occured while reading from replica")
+            except redis.ConnectionError:
+                pass
+            except redis.RedisError as e:
+                logger.exception(e)
+            return super(ReplicaProxyRedis, self).get(*args, **kwargs)
+
+    redis_client = ReplicaProxyRedis(**redis_conf)
+except AttributeError:
+    redis_client = LazyRedis()
 
 
 @memoize
@@ -64,7 +139,7 @@ def prepare_profiles():
 
 def model_profile(model):
     """
-    Returns cacheops profile for a model
+    Returns cacheops profeile for a model
     """
     if model_is_fake(model):
         return None
