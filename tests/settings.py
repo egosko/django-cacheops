@@ -97,12 +97,12 @@ CACHEOPS = {
     'tests.local': {'local_get': True},
     'tests.cacheonsavemodel': {'cache_on_save': True},
     'tests.dbbinded': {'db_agnostic': False},
-    'tests.genericcontainer': {'ops': ('fetch', 'get', 'count')},
-    'tests.All': {'ops': 'all'},
     'tests.*': {},
     'tests.noncachedvideoproxy': None,
     'tests.noncachedmedia': None,
-    'auth.*': {}
+    'auth.*': {},
+    'tests.polymorphica': {'ops': 'all', 'timeout': 60 * 15},
+    'tests.polymorphicb': {'ops': 'all', 'timeout': 60 * 15},
 }
 
 CACHEOPS_LRU = bool(os.environ.get('CACHEOPS_LRU'))

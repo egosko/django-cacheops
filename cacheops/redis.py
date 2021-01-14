@@ -1,5 +1,6 @@
 from __future__ import absolute_import
 import warnings
+from contextlib import contextmanager
 import six
 from logging import getLogger
 
@@ -7,7 +8,6 @@ from django.core.signals import request_started, request_finished
 from django.dispatch import receiver
 from funcy import decorator, identity, memoize
 import redis
-from django.core.exceptions import ImproperlyConfigured
 
 from .conf import settings
 
@@ -66,12 +66,67 @@ else:
     degrade_client_decorator = identity
 
 
-class SafeRedis(redis.StrictRedis):
-    get = handle_connection_failure(degrade_client_decorator(redis.StrictRedis.get))
-    evalsha = degrade_client_decorator(redis.StrictRedis.evalsha)
+LOCK_TIMEOUT = 60
 
 
-Redis = SafeRedis if settings.CACHEOPS_DEGRADE_ON_FAILURE else redis.StrictRedis
+class CacheopsRedis(redis.StrictRedis):
+    get = handle_connection_failure(redis.StrictRedis.get)
+
+    @contextmanager
+    def getting(self, key, lock=False):
+        if not lock:
+            yield self.get(key)
+        else:
+            locked = False
+            try:
+                data = self._get_or_lock(key)
+                locked = data is None
+                yield data
+            finally:
+                if locked:
+                    self._release_lock(key)
+
+    @handle_connection_failure
+    def _get_or_lock(self, key):
+        self._lock = getattr(self, '_lock', self.register_script("""
+            local locked = redis.call('set', KEYS[1], 'LOCK', 'nx', 'ex', ARGV[1])
+            if locked then
+                redis.call('del', KEYS[2])
+            end
+            return locked
+        """))
+        signal_key = key + ':signal'
+
+        while True:
+            data = self.get(key)
+            if data is None:
+                if self._lock(keys=[key, signal_key], args=[LOCK_TIMEOUT]):
+                    return None
+            elif data != b'LOCK':
+                return data
+
+            # No data and not locked, wait
+            self.brpoplpush(signal_key, signal_key, timeout=LOCK_TIMEOUT)
+
+    @handle_connection_failure
+    def _release_lock(self, key):
+        self._unlock = getattr(self, '_unlock', self.register_script("""
+            if redis.call('get', KEYS[1]) == 'LOCK' then
+                redis.call('del', KEYS[1])
+            end
+            redis.call('lpush', KEYS[2], 1)
+            redis.call('expire', KEYS[2], 1)
+        """))
+        signal_key = key + ':signal'
+        self._unlock(keys=[key, signal_key])
+
+
+class SafeRedis(CacheopsRedis):
+    get = handle_connection_failure(degrade_client_decorator(CacheopsRedis.get))
+    evalsha = degrade_client_decorator(CacheopsRedis.evalsha)
+
+
+Redis = SafeRedis if settings.CACHEOPS_DEGRADE_ON_FAILURE else CacheopsRedis
 
 
 class LazyRedis(object):
@@ -100,9 +155,7 @@ try:
     redis_conf = settings.CACHEOPS_REDIS
     redis_replica_conf = settings.CACHEOPS_REDIS_REPLICA
 
-    class SafeReplicaRedis(redis.StrictRedis):
-        get = degrade_client_decorator(redis.StrictRedis.get)
-    redis_replica = SafeReplicaRedis(**redis_replica_conf)
+    redis_replica = CacheopsRedis(**redis_replica_conf)
 
     class ReplicaProxyRedis(Redis):
         """ Proxy `get` calls to redis replica.

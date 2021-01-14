@@ -10,7 +10,7 @@ README = open('README.rst').read()    \
 
 setup(
     name='django-cacheops-readreplica',
-    version='2.4.3',
+    version='3.2.1',
     author='Alexander Schepanovski',
     author_email='suor.web@gmail.com',
 
@@ -28,7 +28,7 @@ setup(
     install_requires=[
         'django>=1.7',
         'redis>=2.9.1',
-        'funcy>=1.2,<2.0',
+        'funcy>=1.7.5,<2.0',
         'six>=1.4.0',
     ],
 
@@ -43,10 +43,13 @@ setup(
         'Programming Language :: Python :: 3.3',
         'Programming Language :: Python :: 3.4',
         'Programming Language :: Python :: 3.5',
+        'Programming Language :: Python :: 3.6',
         'Framework :: Django',
         'Framework :: Django :: 1.7',
         'Framework :: Django :: 1.8',
         'Framework :: Django :: 1.9',
+        'Framework :: Django :: 1.10',
+        'Framework :: Django :: 1.11',
 
         'Environment :: Web Environment',
         'Intended Audience :: Developers',

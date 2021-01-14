@@ -25,7 +25,7 @@ from .utils import monkey_mix, stamp_fields, func_cache_key, cached_view_fab, fa
 from .redis import redis_client, handle_connection_failure, load_script
 from .tree import dnfs
 from .invalidation import invalidate_obj, invalidate_dict, no_invalidation
-from .transaction import in_transaction
+from .transaction import transaction_states
 from .signals import cache_read
 
 
@@ -35,11 +35,13 @@ _local_get_cache = {}
 
 
 @handle_connection_failure
-def cache_thing(cache_key, data, cond_dnfs, timeout):
+def cache_thing(cache_key, data, cond_dnfs, timeout, dbs=()):
     """
     Writes data to cache and creates appropriate invalidators.
     """
-    assert not in_transaction()
+    # Could have changed after last check, sometimes superficially
+    if transaction_states.is_dirty(dbs):
+        return
     load_script('cache_thing', settings.CACHEOPS_LRU)(
         keys=[cache_key],
         args=[
@@ -52,12 +54,17 @@ def cache_thing(cache_key, data, cond_dnfs, timeout):
 
 def cached_as(*samples, **kwargs):
     """
-    Caches results of a function and invalidates them same way as given queryset.
-    NOTE: Ignores queryset cached ops settings, just caches.
+    Caches results of a function and invalidates them same way as given queryset(s).
+    NOTE: Ignores queryset cached ops settings, always caches.
     """
-    timeout = kwargs.get('timeout')
-    extra = kwargs.get('extra')
-    key_func = kwargs.get('key_func', func_cache_key)
+    timeout = kwargs.pop('timeout', None)
+    extra = kwargs.pop('extra', None)
+    key_func = kwargs.pop('key_func', func_cache_key)
+    lock = kwargs.pop('lock', None)
+    if not samples:
+        raise TypeError('Pass a queryset, a model or an object to cache like')
+    if kwargs:
+        raise TypeError('Unexpected keyword arguments %s' % ', '.join(kwargs))
 
     # If we unexpectedly get list instead of queryset return identity decorator.
     # Paginator could do this when page.object_list is empty.
@@ -77,28 +84,31 @@ def cached_as(*samples, **kwargs):
         return queryset
 
     querysets = map(_get_queryset, samples)
+    dbs = {qs.db for qs in querysets}
     cond_dnfs = mapcat(dnfs, querysets)
     key_extra = [qs._cache_key() for qs in querysets]
     key_extra.append(extra)
-    if not timeout:
+    if not timeout:  # TODO: switch to is None on major release
         timeout = min(qs._cacheprofile['timeout'] for qs in querysets)
+    if lock is None:
+        lock = any(qs._cacheprofile['lock'] for qs in querysets)
 
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            if in_transaction() or not settings.CACHEOPS_ENABLED:
+            if not settings.CACHEOPS_ENABLED or transaction_states.is_dirty(dbs):
                 return func(*args, **kwargs)
 
             cache_key = 'as:' + key_func(func, args, kwargs, key_extra)
 
-            cache_data = redis_client.get(cache_key)
-            cache_read.send(sender=None, func=func, hit=cache_data is not None)
-            if cache_data is not None:
-                return pickle.loads(cache_data)
-
-            result = func(*args, **kwargs)
-            cache_thing(cache_key, result, cond_dnfs, timeout)
-            return result
+            with redis_client.getting(cache_key, lock=lock) as cache_data:
+                cache_read.send(sender=None, func=func, hit=cache_data is not None)
+                if cache_data is not None:
+                    return pickle.loads(cache_data)
+                else:
+                    result = func(*args, **kwargs)
+                    cache_thing(cache_key, result, cond_dnfs, timeout, dbs=dbs)
+                    return result
 
         return wrapper
     return decorator
@@ -161,15 +171,16 @@ class QuerySetMixin(object):
 
     def _cache_results(self, cache_key, results):
         cond_dnfs = dnfs(self)
-        cache_thing(cache_key, results, cond_dnfs, self._cacheprofile['timeout'])
+        cache_thing(cache_key, results, cond_dnfs, self._cacheprofile['timeout'], dbs=[self.db])
 
-    def cache(self, ops=None, timeout=None, write_only=None):
+    def cache(self, ops=None, timeout=None, write_only=None, lock=None):
         """
         Enables caching for given ops
             ops        - a subset of {'get', 'fetch', 'count', 'exists'},
                          ops caching to be turned on, all enabled by default
             timeout    - override default cache timeout
             write_only - don't try fetching from cache, still write result there
+            lock       - use lock to prevent dog-pile effect
 
         NOTE: you actually can disable caching by omiting corresponding ops,
               .cache(ops=[]) disables caching for this queryset.
@@ -186,6 +197,8 @@ class QuerySetMixin(object):
             self._cacheprofile['timeout'] = timeout
         if write_only is not None:
             self._cacheprofile['write_only'] = write_only
+        if lock is not None:
+            self._cacheprofile['lock'] = lock
 
         return self
 
@@ -249,12 +262,14 @@ class QuerySetMixin(object):
             return clone
 
     def iterator(self):
+        # TODO: drop this in next major release
         # If cache is not enabled or in transaction just fall back
         if not self._cacheprofile or 'fetch' not in self._cacheprofile['ops'] \
-                or in_transaction() or not settings.CACHEOPS_ENABLED:
+                or not settings.CACHEOPS_ENABLED or transaction_states[self.db].is_dirty():
             return self._no_monkey.iterator(self)
 
         cache_key = self._cache_key()
+        # Get rid of write_only? redo self._for_write?
         if not self._cacheprofile['write_only'] and not self._for_write:
             # Trying get data from cache
             cache_data = redis_client.get(cache_key)
@@ -272,6 +287,32 @@ class QuerySetMixin(object):
             self._cache_results(cache_key, self._result_cache)
 
         return iterate()
+
+    def _fetch_all(self):
+        # If cache is not enabled or in transaction just fall back
+        if not self._cacheprofile or 'fetch' not in self._cacheprofile['ops'] \
+                or not settings.CACHEOPS_ENABLED or transaction_states[self.db].is_dirty():
+            return self._no_monkey._fetch_all(self)
+
+        if self._result_cache is None:
+            cache_key = self._cache_key()
+            lock = self._cacheprofile['lock']
+
+            if self._cacheprofile['write_only'] or self._for_write:
+                # TODO: remove .nocache() when iterator() is dropped
+                self._result_cache = list(self.nocache().iterator())
+                self._cache_results(cache_key, self._result_cache)
+            else:
+                with redis_client.getting(cache_key, lock=lock) as cache_data:
+                    cache_read.send(sender=self.model, func=None, hit=cache_data is not None)
+                    if cache_data is not None:
+                        self._result_cache = pickle.loads(cache_data)
+                    else:
+                        # TODO: remove .nocache() when iterator() is dropped
+                        self._result_cache = list(self.nocache().iterator())
+                        self._cache_results(cache_key, self._result_cache)
+
+        self._no_monkey._fetch_all(self)
 
     def count(self):
         if self._cacheprofile and 'count' in self._cacheprofile['ops']:
@@ -347,7 +388,7 @@ class QuerySetMixin(object):
 def connect_first(signal, receiver, sender):
     old_receivers = signal.receivers
     signal.receivers = []
-    signal.connect(receiver, sender=sender)
+    signal.connect(receiver, sender=sender, weak=False)
     signal.receivers += old_receivers
 
 # We need to stash old object before Model.save() to invalidate on its properties
@@ -376,20 +417,24 @@ class ManagerMixin(object):
             self._install_cacheops(cls)
 
     def _pre_save(self, sender, instance, **kwargs):
-        if instance.pk is not None and not no_invalidation.active:
+        if not (instance.pk is None or instance._state.adding or no_invalidation.active):
             try:
                 _old_objs.__dict__[sender, instance.pk] = sender.objects.get(pk=instance.pk)
             except sender.DoesNotExist:
                 pass
 
     def _post_save(self, sender, instance, **kwargs):
+        if not settings.CACHEOPS_ENABLED:
+            return
+
         # Invoke invalidations for both old and new versions of saved object
         old = _old_objs.__dict__.pop((sender, instance.pk), None)
         if old:
             invalidate_obj(old)
         invalidate_obj(instance)
 
-        if in_transaction() or not settings.CACHEOPS_ENABLED:
+        # We run invalidations but skip caching if we are dirty
+        if transaction_states[instance._state.db].is_dirty():
             return
 
         # NOTE: it's possible for this to be a subclass, e.g. proxy, without cacheprofile,
@@ -458,20 +503,23 @@ def invalidate_m2m(sender=None, instance=None, model=None, action=None, pk_set=N
     if action not in ('pre_clear', 'post_add', 'pre_remove'):
         return
 
+    # NOTE: .rel moved to .remote_field in Django 1.9
+    if django.VERSION >= (1, 9):
+        get_remote = lambda f: f.remote_field
+    else:
+        get_remote = lambda f: f.rel
     m2m = next(m2m for m2m in instance._meta.many_to_many + model._meta.many_to_many
-                   if m2m.rel.through == sender)
+                   if get_remote(m2m).through == sender)
+    instance_column, model_column = m2m.m2m_column_name(), m2m.m2m_reverse_name()
+    if reverse:
+        instance_column, model_column = model_column, instance_column
 
     # TODO: optimize several invalidate_objs/dicts at once
     if action == 'pre_clear':
-        # TODO: always use column names here once Django 1.3 is dropped
-        instance_field = m2m.m2m_reverse_field_name() if reverse else m2m.m2m_field_name()
-        objects = sender.objects.filter(**{instance_field: instance.pk})
+        objects = sender.objects.filter(**{instance_column: instance.pk})
         for obj in objects:
             invalidate_obj(obj)
     elif action in ('post_add', 'pre_remove'):
-        instance_column, model_column = m2m.m2m_column_name(), m2m.m2m_reverse_name()
-        if reverse:
-            instance_column, model_column = model_column, instance_column
         # NOTE: we don't need to query through objects here,
         #       cause we already know all their meaningfull attributes.
         for pk in pk_set:
