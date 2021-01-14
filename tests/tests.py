@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
-import re, copy
+import re
 import unittest
 
 from django.db import connection, connections
 from django.test import TestCase
 from django.test.client import RequestFactory
-from django.contrib.auth.models import User, Group, Permission
-from django.contrib.contenttypes.models import ContentType
+from django.contrib.auth.models import User
 from django.template import Context, Template
 from django.db.models import F
 
@@ -14,11 +13,11 @@ from cacheops import invalidate_all, invalidate_model, invalidate_obj, no_invali
                      cached, cached_view, cached_as, cached_view_as
 from cacheops import invalidate_fragment
 from cacheops.templatetags.cacheops import register
-from cacheops.transaction import transaction_state
+from cacheops.transaction import transaction_states
 from cacheops.signals import cache_read
 
 decorator_tag = register.decorator_tag
-from .models import *
+from .models import *  # noqa
 
 
 class BaseTestCase(TestCase):
@@ -26,12 +25,14 @@ class BaseTestCase(TestCase):
         # Emulate not being in transaction by tricking system to ignore its pretest level.
         # TestCase wraps each test into 1 or 2 transaction(s) altering cacheops behavior.
         # The alternative is using TransactionTestCase, which is 10x slow.
-        transaction_state._stack, self._stack = [], transaction_state._stack
+        from funcy import empty
+        transaction_states._states, self._states \
+            = empty(transaction_states._states), transaction_states._states
 
         invalidate_all()
 
     def tearDown(self):
-        transaction_state._stack = self._stack
+        transaction_states._states = self._states
 
 
 class BasicTests(BaseTestCase):
@@ -66,6 +67,7 @@ class BasicTests(BaseTestCase):
         with self.assertNumQueries(1):
             list(Category.objects.exclude(pk__in=range(10), pk__isnull=False).cache())
 
+    # TODO: remove this test when .iterator() is removed
     def test_lazy(self):
         inc = _make_inc()
 
@@ -76,6 +78,8 @@ class BasicTests(BaseTestCase):
         for c in qs.iterator():
             break
         self.assertEqual(inc.get(), 1)
+
+        post_init.disconnect(inc)
 
     def test_invalidation(self):
         post = Post.objects.cache().get(pk=1)
@@ -133,24 +137,10 @@ class BasicTests(BaseTestCase):
             Extra.objects.cache().get(to_tag=5)
 
     def test_expressions(self):
-        queries = (
-            {'tag': F('tag')},
-            {'tag': F('to_tag')},
-            {'tag': F('to_tag') * 2},
-            {'tag': F('to_tag') + (F('tag') / 2)},
-        )
-        if hasattr(F, 'bitor'):
-            queries += (
-                {'tag': F('tag').bitor(5)},
-                {'tag': F('to_tag').bitor(5)},
-                {'tag': F('tag').bitor(5) + 1},
-                {'tag': F('tag').bitor(5) * F('to_tag').bitor(5)}
-            )
-        count = len(queries)
-        for c in (count, 0):
-            with self.assertNumQueries(c):
-                for q in queries:
-                    Extra.objects.cache().filter(**q).count()
+        qs = Extra.objects.cache().filter(tag=F('to_tag') + 1, to_tag=F('tag').bitor(5))
+        qs.count()
+        with self.assertNumQueries(0):
+            qs.count()
 
     def test_expressions_save(self):
         # Check saving F
@@ -460,9 +450,6 @@ class IssueTests(BaseTestCase):
     def test_29(self):
         Brand.objects.exclude(labels__in=[1, 2, 3]).cache().count()
 
-    def test_39(self):
-        list(Point.objects.filter(x=7).cache())
-
     def test_45(self):
         m = CacheOnSaveModel(title="test")
         m.save()
@@ -470,59 +457,11 @@ class IssueTests(BaseTestCase):
         with self.assertNumQueries(0):
             CacheOnSaveModel.objects.cache().get(pk=m.pk)
 
-    def test_54(self):
-        qs = Category.objects.all()
-        list(qs) # force load objects to quesryset cache
-        qs.count()
-
-    def test_56(self):
-        Post.objects.exclude(extra__in=[1, 2]).cache().count()
-
     def test_57(self):
         list(Post.objects.filter(category__in=Category.objects.nocache()).cache())
 
-    def test_58(self):
-        list(Post.objects.cache().none())
-
-    def test_62(self):
-        # setup
-        product = Product.objects.create(name='62')
-        ProductReview.objects.create(product=product, status=0)
-        ProductReview.objects.create(product=None, status=0)
-
-        # Test related manager filtering works, .get() will throw MultipleObjectsReturned if not
-        # The bug is related manager not respected when .get() is called
-        product.reviews.get(status=0)
-
-    def test_70(self):
-        Contained(name="aaa").save()
-        contained_obj = Contained.objects.get(name="aaa")
-        GenericContainer(content_object=contained_obj, name="bbb").save()
-
-        qs = Contained.objects.cache().filter(containers__name="bbb")
-        list(qs)
-
-    def test_82(self):
-        list(copy.deepcopy(Post.objects.all()).cache())
-
-    def test_100(self):
-        g = Group.objects.create()
-        g.user_set.add(self.user)
-
     def test_114(self):
         list(Category.objects.cache().filter(title=u'ó'))
-
-    def test_117(self):
-        list(All.objects.all())
-
-        with self.assertNumQueries(0):
-            list(All.objects.all())
-
-    def test_117_manual(self):
-        list(All.objects.cache(ops='all').all())
-
-        with self.assertNumQueries(0):
-            list(All.objects.cache(ops='all').all())
 
     def test_145(self):
         # Create One with boolean False
@@ -551,20 +490,6 @@ class IssueTests(BaseTestCase):
         # Cache must stay for another_brand
         with self.assertNumQueries(0):
             list(another_brand.labels.cache())
-        # ... and should be invalidated for brand
-        with self.assertNumQueries(1):
-            list(brand.labels.cache())
-
-    def test_159_case2(self):
-        base = M2MBase.objects.create()
-        target = M2MWithCharId.objects.create(id="stub_id")
-        base.char_many_to_many.add(target)
-
-        list(base.char_many_to_many.cache())
-        target.m2mbase_set.clear()
-
-        with self.assertNumQueries(1):
-            list(base.char_many_to_many.cache())
 
     def test_161(self):
         categories = Category.objects.using('slave').filter(title='Python')
@@ -581,24 +506,6 @@ class IssueTests(BaseTestCase):
         c.posts.get(visible=1)  # this used to fail
 
     def test_173(self):
-        g = Group.objects.create(name='gr')
-        g.user_set.add(self.user)
-        content_type = ContentType.objects.get_for_model(User)
-        p = Permission.objects.create(name='foobar',
-                                      content_type=content_type)
-
-        # Cache it
-        list(Permission.objects.filter(group__user=self.user).cache())
-
-        # Add permission to group. m2m_changed will be emited
-        g.permissions.add(p)
-
-        # Note that we don't query per group nor permission here,
-        # this is why this cache won't be invalidated.
-        perms = list(Permission.objects.filter(group__user=self.user).cache())
-        self.assertEqual(perms, [p])
-
-    def test_173_simple(self):
         extra = Extra.objects.get(pk=1)
         title = extra.post.category.title
 
@@ -612,22 +519,27 @@ class IssueTests(BaseTestCase):
         # Fail because neither Extra nor Catehory changed, but something in between
         self.assertEqual([], list(Extra.objects.filter(post__category__title=title).cache()))
 
+    # TODO: remove with QuerySetMixin.iterator() on next major release
     def test_177(self):
         c = Category.objects.get(pk=1)
         c.posts_copy = c.posts.cache()
         bool(c.posts_copy)
 
+    def test_217(self):
+        # Destroy and recreate model manager
+        Post.objects.__class__().contribute_to_class(Post, 'objects')
 
-@unittest.skipUnless(os.environ.get('LONG'), "Too long")
-class LongTests(BaseTestCase):
-    fixtures = ['basic']
+        # Test invalidation
+        post = Post.objects.cache().get(pk=1)
+        post.title += ' changed'
+        post.save()
 
-    def test_big_invalidation(self):
-        for x in range(8000):
-            list(Category.objects.cache().exclude(pk=x))
+        with self.assertNumQueries(1):
+            changed_post = Post.objects.cache().get(pk=1)
+            self.assertEqual(post.title, changed_post.title)
 
-        c = Category.objects.get(pk=1)
-        invalidate_obj(c) # lua unpack() fails with 8000 keys, workaround works
+    def test_232(self):
+        list(Post.objects.cache().filter(category__in=[None, 1]).filter(category=1))
 
 
 class LocalGetTests(BaseTestCase):
@@ -766,20 +678,9 @@ class M2MTests(BaseTestCase):
             lambda: self.bf.labels.remove(self.furious)
         )
 
+
 class MultiTableInheritanceWithM2MTest(M2MTests):
-
-    def setUp(self):
-        self.bf = PremiumBrand.objects.create()
-        self.bs = PremiumBrand.objects.create()
-
-        self.fast = Label.objects.create(text='fast')
-        self.slow = Label.objects.create(text='slow')
-        self.furious = Label.objects.create(text='furios')
-
-        self.bf.labels.add(self.fast, self.furious)
-        self.bs.labels.add(self.slow, self.furious)
-
-        super(M2MTests, self).setUp()
+    brand_cls = PremiumBrand
 
 
 class M2MThroughTests(M2MTests):
@@ -1012,6 +913,52 @@ class SignalsTests(BaseTestCase):
         self.signal_calls = []
         self.assertEqual(get_calls(), 1)
         self.assertEqual(self.signal_calls, [{'sender': None, 'func': func, 'hit': True}])
+
+
+class LockingTests(BaseTestCase):
+    def test_lock(self):
+        import random
+        import threading
+        from .utils import ThreadWithReturnValue
+        from before_after import before
+
+        @cached_as(Post, lock=True, timeout=60)
+        def func():
+            return random.random()
+
+        results = []
+        locked = threading.Event()
+        thread = [None]
+
+        def second_thread():
+            def _target():
+                try:
+                    with before('redis.StrictRedis.brpoplpush', lambda *a, **kw: locked.set()):
+                        results.append(func())
+                except Exception:
+                    locked.set()
+                    raise
+
+            thread[0] = ThreadWithReturnValue(target=_target)
+            thread[0].start()
+            assert locked.wait(1)  # Wait until right before the block
+
+        with before('random.random', second_thread):
+            results.append(func())
+
+        thread[0].join()
+
+        self.assertEqual(results[0], results[1])
+
+
+# TODO: remove this test when .iterator() is dropped
+@unittest.skipIf(PolymorphicModel is None, "django-polumorphic doesn't work with Django 2.0")
+class PolymorphicTests(BaseTestCase):
+    def test_polymorphic(self):
+        b = PolymorphicB.objects.create()
+        z = PolymorphicZ.objects.create(a=b)
+        z2 = PolymorphicZ.objects.get(id=z.id)
+        self.assertEqual(type(z2.a), PolymorphicB)
 
 
 # Utilities

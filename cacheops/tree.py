@@ -68,6 +68,8 @@ def dnfs(qs):
             if isinstance(where.lhs.target, NOT_SERIALIZED_FIELDS):
                 return SOME_TREE
 
+            # 1.10: django.db.models.fields.related_lookups.RelatedExact
+
             attname = where.lhs.target.attname
             if isinstance(where, Exact):
                 return [[(where.lhs.alias, attname, where.rhs, True)]]
@@ -81,6 +83,7 @@ def dnfs(qs):
             return [[]]
         elif isinstance(where, NothingNode):
             return []
+            # SubqueryConstraint - Django 1.7
         elif isinstance(where, (ExtraWhere, SubqueryConstraint)):
             return SOME_TREE
         elif len(where) == 0:
@@ -107,12 +110,20 @@ def dnfs(qs):
             return result
 
     def clean_conj(conj, for_alias):
-        # "SOME" conds, negated conds and conds for other aliases should be stripped
-        return [(attname, value) for alias, attname, value, negation in conj
-                                 if value is not SOME and negation and alias == for_alias]
+        conds = {}
+        for alias, attname, value, negation in conj:
+            # "SOME" conds, negated conds and conds for other aliases should be stripped
+            if value is not SOME and negation and alias == for_alias:
+                # Conjs with fields eq 2 different values will never cause invalidation
+                if attname in conds and conds[attname] != value:
+                    return None
+                conds[attname] = value
+        return conds.items()
 
     def clean_dnf(tree, for_alias):
         cleaned = [clean_conj(conj, for_alias) for conj in tree]
+        # Remove deleted conjunctions
+        cleaned = [conj for conj in cleaned if conj is not None]
         # Any empty conjunction eats up the rest
         # NOTE: a more elaborate DNF reduction is not really needed,
         #       just keep your querysets sane.
@@ -137,9 +148,3 @@ def dnfs(qs):
     aliases = {alias for alias, cnt in qs.query.alias_refcount.items() if cnt} \
             | {main_alias} - {'django_content_type'}
     return [(table_for(alias), clean_dnf(dnf, alias)) for alias in aliases]
-
-
-def attname_of(model, col, cache={}):
-    if model not in cache:
-        cache[model] = {f.db_column: f.attname for f in model._meta.fields}
-    return cache[model].get(col, col)
