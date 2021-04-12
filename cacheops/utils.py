@@ -2,6 +2,8 @@
 import re
 import json
 import inspect
+import sys
+
 from funcy import memoize, compose, wraps, any, partial
 from funcy.py2 import mapcat
 from .cross import md5hex
@@ -107,6 +109,8 @@ def func_cache_key(func, args, kwargs, extra=None, debug=False):
             return str(obj)
 
     factors = [obj_key(func), args, kwargs, extra]
+    if sys.version_info[0] > 2:
+        factors = ['.'.join(str(i) for i in sys.version_info[:2])] + factors
     return md5hex(json.dumps(factors, sort_keys=True, default=obj_key))
 
 debug_cache_key = partial(func_cache_key, debug=True)

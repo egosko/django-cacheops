@@ -10,7 +10,7 @@ README = open('README.rst').read()    \
 
 setup(
     name='django-cacheops-readreplica',
-    version='3.2.1',
+    version='3.2.2',
     author='Alexander Schepanovski',
     author_email='suor.web@gmail.com',
 
